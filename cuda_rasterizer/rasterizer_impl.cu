@@ -217,6 +217,7 @@ int CudaRasterizer::Rasterizer::forward(
 	float* out_color,
 	float* out_depth,
 	float* out_alpha,
+  float* out_depth_var,
 	int* radii,
 	bool debug)
 {
@@ -281,6 +282,11 @@ int CudaRasterizer::Rasterizer::forward(
 	int num_rendered;
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
 
+  // printf("Total Number of Duplicated Gaussians : %d\n", num_rendered);
+  // printf("P (Total Number Of Gaussians) : %d\n", P);
+  // printf("D : %d\n", D);
+  // printf("M : %d\n", M);
+
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
@@ -299,6 +305,7 @@ int CudaRasterizer::Rasterizer::forward(
 	CHECK_CUDA(, debug)
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+  // printf("Tile Grid X / Tile Grid Y / bit : %d %d %d\n", tile_grid.x, tile_grid.y, bit);
 
 	// Sort complete list of (duplicated) Gaussian indices by keys
 	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
@@ -310,12 +317,23 @@ int CudaRasterizer::Rasterizer::forward(
 
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
+  int num_tile = tile_grid.x * tile_grid.y;
+  // printf("Num Tile : %d\n", num_tile);
+
 	// Identify start and end of per-tile workloads in sorted list
 	if (num_rendered > 0)
 		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
 			num_rendered,
 			binningState.point_list_keys,
 			imgState.ranges);
+  for(size_t i = 0; i < 10; i++) {
+    unsigned int *rgx, *rgy;
+    rgx = (unsigned int *)malloc(sizeof(unsigned int));
+    rgy = (unsigned int *)malloc(sizeof(unsigned int));
+    cudaMemcpy(rgx, &imgState.ranges[i].x, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(rgy, &imgState.ranges[i].y, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+    // printf("\tRange of %d : %d -> %d\n", int(i), int(*rgx), int(*rgy));
+  }
 	CHECK_CUDA(, debug);
 
 	// Let each tile blend its range of Gaussians independently in parallel
@@ -333,7 +351,8 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.n_contrib,
 		background,
 		out_color,
-		out_depth), debug);
+		out_depth,
+    out_depth_var), debug);
 
 	return num_rendered;
 }
@@ -348,6 +367,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* shs,
 	const float* colors_precomp,
 	const float* alphas,
+  const float* depths,
 	const float* scales,
 	const float scale_modifier,
 	const float* rotations,
@@ -363,6 +383,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* dL_dpix,
 	const float* dL_dpix_depth,
 	const float* dL_dalphas,
+	const float* dL_dpix_depth_var,
 	float* dL_dmean2D,
 	float* dL_dconic,
 	float* dL_dopacity,
@@ -407,10 +428,12 @@ void CudaRasterizer::Rasterizer::backward(
 		color_ptr,
 		depth_ptr,
 		alphas,
+    depths,
 		imgState.n_contrib,
 		dL_dpix,
 		dL_dpix_depth,
 		dL_dalphas,
+    dL_dpix_depth_var,
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,

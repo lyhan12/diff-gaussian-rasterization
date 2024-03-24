@@ -51,6 +51,7 @@ namespace CudaRasterizer
 			float* out_color,
 			float* out_depth,
 			float* out_alpha,
+      float* out_depth_var,
 			int* radii = nullptr,
 			bool debug = false);
 
@@ -62,6 +63,7 @@ namespace CudaRasterizer
 			const float* shs,
 			const float* colors_precomp,
 			const float* alphas,
+      const float* depths,
 			const float* scales,
 			const float scale_modifier,
 			const float* rotations,
@@ -77,6 +79,7 @@ namespace CudaRasterizer
 			const float* dL_dpix,
 			const float* dL_dpix_depth,
 			const float* dL_dalphas,
+			const float* dL_dpix_depth_var,
 			float* dL_dmean2D,
 			float* dL_dconic,
 			float* dL_dopacity,

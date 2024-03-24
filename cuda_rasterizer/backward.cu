@@ -424,10 +424,12 @@ renderCUDA(
 	const float* __restrict__ colors,
 	const float* __restrict__ depths,
 	const float* __restrict__ alphas,
+	const float* __restrict__ pixel_depths,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_dpixel_depths,
 	const float* __restrict__ dL_dalphas,
+	const float* __restrict__ dL_dpixel_depths_var,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
@@ -471,13 +473,17 @@ renderCUDA(
 	float accum_rec[C] = { 0 };
 	float dL_dpixel[C];
 	float accum_depth_rec = 0;
+	float accum_depth_var_rec = 0;
 	float dL_dpixel_depth;
+  float dL_dpixel_depth_var;
 	float accum_alpha_rec = 0;
 	float dL_dalpha;
+  float pixel_depth = pixel_depths[pix_id];
 	if (inside) {
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
 		dL_dpixel_depth = dL_dpixel_depths[pix_id];
+    dL_dpixel_depth_var = dL_dpixel_depths_var[pix_id];
 		dL_dalpha = dL_dalphas[pix_id];
 	}
 
@@ -531,9 +537,12 @@ renderCUDA(
 			if (alpha < 1.0f / 255.0f)
 				continue;
 
+			const float c_d = collected_depths[j];
+
 			T = T / (1.f - alpha);
 			const float dchannel_dcolor = alpha * T;
 			const float dpixel_depth_ddepth = alpha * T;
+      const float dpixel_depth_var_ddepth = (c_d - pixel_depth) * alpha * T;
 
 			// Propagate gradients to per-Gaussian colors and keep
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
@@ -556,11 +565,15 @@ renderCUDA(
 			}
 			
 			// Propagate gradients from pixel depth to opacity
-			const float c_d = collected_depths[j];
 			accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
 			last_depth = c_d;
 			dL_dopa += (c_d - accum_depth_rec) * dL_dpixel_depth;
 			atomicAdd(&(dL_ddepths[global_id]), dpixel_depth_ddepth * dL_dpixel_depth);
+			atomicAdd(&(dL_ddepths[global_id]), dpixel_depth_var_ddepth * dL_dpixel_depth_var);
+
+
+			accum_depth_var_rec = last_alpha * 0.5 * (last_depth - pixel_depth) * (last_depth - pixel_depth) + (1.f - last_alpha) * accum_depth_var_rec;
+      dL_dopa += (0.5 * (c_d - pixel_depth) * (c_d - pixel_depth) - accum_depth_var_rec) * dL_dpixel_depth_var;
 
 			// Propagate gradients from pixel alpha (weights_sum) to opacity
 			accum_alpha_rec = last_alpha + (1.f - last_alpha) * accum_alpha_rec;
@@ -679,10 +692,12 @@ void BACKWARD::render(
 	const float* colors,
 	const float* depths,
 	const float* alphas,
+  const float* pixel_depths,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
 	const float* dL_dpixel_depths,
 	const float* dL_dalphas,
+	const float* dL_dpixel_depths_var,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
@@ -699,10 +714,12 @@ void BACKWARD::render(
 		colors,
 		depths,
 		alphas,
+    pixel_depths,
 		n_contrib,
 		dL_dpixels,
 		dL_dpixel_depths,
 		dL_dalphas,
+		dL_dpixel_depths_var,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,

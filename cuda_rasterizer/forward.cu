@@ -272,7 +272,8 @@ renderCUDA(
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
-	float* __restrict__ out_depth)
+	float* __restrict__ out_depth,
+  float* __restrict__ out_depth_var)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -305,6 +306,16 @@ renderCUDA(
 	float C[CHANNELS] = { 0 };
 	float weight = 0;
 	float D = 0;
+  float var_D = 0;
+
+  int block_id = block.group_index().y * horizontal_blocks + block.group_index().x;
+  int thread_id = block.thread_rank();
+
+  if(block_id == 0 && thread_id == 0) {
+    //printf("[Block %d / Thread %d] Ranges : %d - %d\n", block_id, thread_id, int(range.x), int(range.y));
+  }
+  float cdf_alpha = 0.0;
+  float cdf_alpha_T = 0.0;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -323,7 +334,7 @@ renderCUDA(
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 		}
-		block.sync();
+		block.sync();    
 
 		// Iterate over current batch
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
@@ -354,6 +365,9 @@ renderCUDA(
 				continue;
 			}
 
+      cdf_alpha += alpha;
+      cdf_alpha_T += alpha * T;
+
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
@@ -368,6 +382,98 @@ renderCUDA(
 		}
 	}
 
+  float low_alpha_T = 0.16 * cdf_alpha;
+  float hgh_alpha_T = 0.84 * cdf_alpha;
+
+	bool re_done = !inside;
+	int re_toDo = range.y - range.x;
+
+  float re_cdf_alpha = 0.0;
+  float re_cdf_alpha_T = 0.0;
+
+	float re_T = 1.0f;
+	uint32_t re_contributor = 0;
+
+  bool re_pass_low = false;
+  bool re_pass_hgh = false;
+  int re_range_low = -1;
+  int re_range_hgh = -1;
+
+	for (int i = 0; i < rounds; i++, re_toDo -= BLOCK_SIZE)
+	{
+		// End if entire block votes that it is done rasterizing
+		int num_done = __syncthreads_count(re_done);
+		if (num_done == BLOCK_SIZE)
+			break;
+
+		// Collectively fetch per-Gaussian data from global to shared
+		int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			int coll_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+		}
+		block.sync();    
+
+		// Iterate over current batch
+		for (int j = 0; !re_done && j < min(BLOCK_SIZE, re_toDo); j++)
+		{
+			// Keep track of current position in range
+			re_contributor++;
+
+			// Resample using conic matrix (cf. "Surface 
+			// Splatting" by Zwicker et al., 2001)
+			float2 xy = collected_xy[j];
+			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			float4 con_o = collected_conic_opacity[j];
+			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+
+			// Eq. (2) from 3D Gaussian splatting paper.
+			// Obtain alpha by multiplying with Gaussian opacity
+			// and its exponential falloff from mean.
+			// Avoid numerical instabilities (see paper appendix). 
+			float alpha = min(0.99f, con_o.w * exp(power));
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			float test_T = re_T * (1 - alpha);
+			if (test_T < 0.0001f)
+			{
+				re_done = true;
+				continue;
+			}
+
+      re_cdf_alpha += alpha;
+      re_cdf_alpha_T += alpha * re_T;
+
+      if(!re_pass_low && re_cdf_alpha > low_alpha_T){
+        re_pass_low = true;
+        re_range_low = re_contributor; 
+      }
+      if(!re_pass_hgh && re_cdf_alpha > hgh_alpha_T) {
+        re_pass_hgh = true;
+        re_range_hgh = re_contributor - 1;
+      }
+
+      float depth = depths[collected_id[j]];
+      var_D += 0.5 * (depth - D) * (depth - D) * alpha * T;
+			re_T = test_T;
+
+      bool use_flag = (low_alpha_T < re_cdf_alpha) && (re_cdf_alpha < hgh_alpha_T);
+
+      if(block_id == 0 && thread_id == 0) {
+        //printf("\t[Block %d / Thread %d] Re-Processing %4d : %d | %4.6f (depth) %f (alpha) %f (c-alpha) %f (c-alpha-T) %f (T) %f (opacity) | %d (ID)\n", block_id, thread_id, re_contributor, use_flag, depths[collected_id[j]], alpha, re_cdf_alpha, re_cdf_alpha_T, re_T, con_o.w, collected_id[j]);
+      }
+		}
+	}
+
+  // if(block_id == 0 && thread_id == 0) {
+  //   printf("\t[Block %d / Thread %d] %d %d %d %d | %lf %lf (var D - std D) \n", block_id, thread_id, range.x, re_range_low, re_range_hgh, range.y, var_D, sqrt(var_D));
+  // }
+
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
 	if (inside)
@@ -377,6 +483,7 @@ renderCUDA(
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 		out_alpha[pix_id] = weight; //1 - T;
 		out_depth[pix_id] = D;
+    out_depth_var[pix_id] = var_D;
 	}
 }
 
@@ -393,8 +500,10 @@ void FORWARD::render(
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
-	float* out_depth)
+	float* out_depth,
+  float* out_depth_var)
 {
+  //printf("Forward Render Start\n");
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
 		point_list,
@@ -407,7 +516,10 @@ void FORWARD::render(
 		n_contrib,
 		bg_color,
 		out_color,
-		out_depth);
+		out_depth,
+    out_depth_var);
+
+  //printf("Forward Render Done\n");
 }
 
 void FORWARD::preprocess(int P, int D, int M,
